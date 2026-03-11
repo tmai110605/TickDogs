@@ -2,10 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 from .common import conv1x1_block, conv3x3_block, Classifier
 
 # =============================================================================
-# 1. MIXED ATTENTION FUSION (MAF) - Giữ nguyên từ bản của bạn
+# 1. MIXED ATTENTION FUSION (MAF)
 # =============================================================================
 class Flatten(nn.Module):
     def forward(self, x):
@@ -47,126 +48,103 @@ class MAF(nn.Module):
     def forward(self, x):
         return self.ChannelGate(x)
 
+
 # =============================================================================
-# 2. CẢI TIẾN: PARTIAL TOP OPERATOR (Trích xuất 3D siêu nhẹ)
+# 2. TOÁN TỬ NETTOP (Trích xuất đa mặt phẳng 3D)
 # =============================================================================
-class Partial_TOP_Operator(nn.Module):
+class TOP_Operator(nn.Module):
     def __init__(self, channels, stride=1):
-        super(Partial_TOP_Operator, self).__init__()
+        super(TOP_Operator, self).__init__()
         self.stride = stride
-        self.top_channels = channels // 2  # Chỉ dùng TOP cho 1 nửa số kênh
-        self.dw_channels = channels - self.top_channels
         
-        # Nhánh 1: Depthwise 2D thông thường cho nửa kênh đầu (Rất nhẹ)
-        self.dw_standard = nn.Sequential(
-            nn.Conv2d(self.dw_channels, self.dw_channels, 3, stride, 1, groups=self.dw_channels, bias=False),
-            nn.BatchNorm2d(self.dw_channels)
-        )
+        # Mặt phẳng XY (Conv2d)
+        self.dw_xy = nn.Conv2d(channels, channels, 3, stride, 1, groups=channels, bias=False)
+        self.bn_xy = nn.BatchNorm2d(channels)
         
-        # Nhánh 2: TOP Operator cho nửa kênh sau (Chi tiết 3D)
-        self.dw_xy = nn.Conv2d(self.top_channels, self.top_channels, 3, stride, 1, groups=self.top_channels, bias=False)
-        self.bn_xy = nn.BatchNorm2d(self.top_channels)
+        # Mặt phẳng XZ và YZ (Conv1d)
+        self.dw_xz = nn.Conv1d(channels, channels, 3, 1, 1, groups=channels, bias=False)
+        self.bn_xz = nn.BatchNorm2d(channels)
         
-        self.dw_xz = nn.Conv1d(self.top_channels, self.top_channels, 3, 1, 1, groups=self.top_channels, bias=False)
-        self.bn_xz = nn.BatchNorm2d(self.top_channels)
-        
-        self.dw_yz = nn.Conv1d(self.top_channels, self.top_channels, 3, 1, 1, groups=self.top_channels, bias=False)
-        self.bn_yz = nn.BatchNorm2d(self.top_channels)
+        self.dw_yz = nn.Conv1d(channels, channels, 3, 1, 1, groups=channels, bias=False)
+        self.bn_yz = nn.BatchNorm2d(channels)
         
         self.pool = nn.AvgPool2d(kernel_size=stride, stride=stride) if stride > 1 else nn.Identity()
 
     def forward(self, x):
-        # Tách kênh
-        x_std, x_top = torch.split(x, [self.dw_channels, self.top_channels], dim=1)
-        
-        # Xử lý nhánh chuẩn
-        out_std = self.dw_standard(x_std)
-        
-        # Xử lý nhánh TOP
-        b, c, h, w = x_top.size()
-        f_xy = self.bn_xy(self.dw_xy(x_top))
+        b, c, h, w = x.size()
 
-        x_xz = x_top.permute(0, 2, 1, 3).contiguous().view(b * h, c, w)
-        f_xz = self.dw_xz(x_xz).view(b, h, c, w).permute(0, 2, 1, 3).contiguous()
+        # 1. XY
+        f_xy = self.bn_xy(self.dw_xy(x))
+
+        # 2. XZ
+        x_xz = x.permute(0, 2, 1, 3).contiguous().view(b * h, c, w)
+        f_xz = self.dw_xz(x_xz)
+        f_xz = f_xz.view(b, h, c, w).permute(0, 2, 1, 3).contiguous()
         f_xz = self.pool(self.bn_xz(f_xz))
 
-        x_yz = x_top.permute(0, 3, 1, 2).contiguous().view(b * w, c, h)
-        f_yz = self.dw_yz(x_yz).view(b, w, c, h).permute(0, 2, 3, 1).contiguous()
+        # 3. YZ
+        x_yz = x.permute(0, 3, 1, 2).contiguous().view(b * w, c, h)
+        f_yz = self.dw_yz(x_yz)
+        f_yz = f_yz.view(b, w, c, h).permute(0, 2, 3, 1).contiguous()
         f_yz = self.pool(self.bn_yz(f_yz))
 
-        out_top = f_xy * torch.sigmoid(f_xz * f_yz)
-        
-        # Ghép nối lại và kích hoạt
-        return torch.relu(torch.cat([out_std, out_top], dim=1))
+        # Kết hợp và kích hoạt
+        combined = f_xy * torch.sigmoid(f_xz * f_yz)
+        return torch.relu(combined)
+
 
 # =============================================================================
-# 3. CẢI TIẾN: SHUFFLE & LITE FR-PDP BLOCK
+# 3. Tích hợp TOP và MAF
 # =============================================================================
-class ChannelShuffle(nn.Module):
-    def __init__(self, groups):
-        super(ChannelShuffle, self).__init__()
-        self.groups = groups
-
-    def forward(self, x):
-        b, c, h, w = x.size()
-        c_per_group = c // self.groups
-        x = x.view(b, self.groups, c_per_group, h, w)
-        x = torch.transpose(x, 1, 2).contiguous()
-        return x.view(b, -1, h, w)
-
-class Lite_FR_PDP_block(nn.Module):
-    def __init__(self, in_channels, out_channels, stride, groups=4):
+class FR_PDP_block(nn.Module):
+    def __init__(self, in_channels, out_channels, stride):
         super().__init__()
         self.stride = stride
         self.in_channels = in_channels
         self.out_channels = out_channels
         
-        # Đổi thành Grouped Conv 1x1 + Shuffle
-        self.Pw1 = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, 1, groups=groups, bias=False),
-            # Không dùng BN sau Pw1 theo thiết kế FR-PDP gốc để giữ nguyên phân phối
-        )
-        self.shuffle = ChannelShuffle(groups)
+        self.Pw1 = conv1x1_block(in_channels=in_channels, out_channels=in_channels, use_bn=False, activation=None)
         
-        # Thay thế TOP bằng Partial TOP siêu nhẹ
-        self.TOP_Lite = Partial_TOP_Operator(channels=in_channels, stride=stride)         
+        # SỬ DỤNG NETTOP THAY CHO DEPTHWISE GỐC
+        self.TOP = TOP_Operator(channels=in_channels, stride=stride)         
         
-        # Đổi thành Grouped Conv 1x1
-        self.Pw2 = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 1, groups=groups, bias=False),
-            nn.BatchNorm2d(out_channels)
-        )
+        self.Pw2 = conv1x1_block(in_channels=in_channels, out_channels=out_channels, groups=1)
+        self.PwR = conv1x1_block(in_channels=in_channels, out_channels=out_channels, stride=stride)
         
-        # Đường tắt Full-Residual
-        if self.stride != 1 or self.in_channels != self.out_channels:
-            self.PwR = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, 1, stride, bias=False),
-                nn.BatchNorm2d(out_channels)
-            )
-        else:
-            self.PwR = nn.Identity()
-            
-        # MAF Attention
+        # SỬ DỤNG MAF THAY CHO SE GỐC
         self.attention = MAF(out_channels, 16)
 
     def forward(self, x):
-        residual = self.PwR(x)
+        residual = x
+        x = self.Pw1(x)        
+        x = self.TOP(x)        
+        x = self.Pw2(x)
+        x = self.attention(x)
         
-        out = self.Pw1(x)
-        out = self.shuffle(out)
-        out = self.TOP_Lite(out)        
-        out = self.Pw2(out)
-        out = self.attention(out)
-        
-        return F.relu(out + residual, inplace=True)
+        if self.stride == 1 and self.in_channels == self.out_channels:
+            x = x + residual
+        else:            
+            residual = self.PwR(residual)
+            x = x + residual
+        return x
+
 
 # =============================================================================
-# 4. MẠNG TICKNET (Giữ nguyên cấu trúc nhưng dùng block mới)
+# 4. MẠNG TICKNET
 # =============================================================================
 class TickNet(nn.Module):
-    def __init__(self, num_classes, init_conv_channels, init_conv_stride, channels, strides, in_channels=3, use_data_batchnorm=True):
+    def __init__(self,
+                 num_classes,
+                 init_conv_channels,
+                 init_conv_stride,
+                 channels,
+                 strides,
+                 in_channels=3,
+                 in_size=(224, 224),
+                 use_data_batchnorm=True):
         super().__init__()
         self.use_data_batchnorm = use_data_batchnorm
+        self.in_size = in_size
 
         self.backbone = nn.Sequential()
 
@@ -177,18 +155,20 @@ class TickNet(nn.Module):
                                                             out_channels=init_conv_channels, 
                                                             stride=init_conv_stride))
 
-        # Build Backbone với Lite_FR_PDP_block
-        in_c = init_conv_channels
+        # XÂY DỰNG BACKBONE 
+        in_channels = init_conv_channels
         for stage_id, stage_channels in enumerate(channels):
             stage = nn.Sequential()
-            for unit_id, out_c in enumerate(stage_channels):
+            for unit_id, unit_channels in enumerate(stage_channels):
                 stride = strides[stage_id] if unit_id == 0 else 1                
-                stage.add_module(f"unit{unit_id + 1}", Lite_FR_PDP_block(in_channels=in_c, out_channels=out_c, stride=stride))
-                in_c = out_c
+                stage.add_module(f"unit{unit_id + 1}", FR_PDP_block(in_channels=in_channels, 
+                                                                    out_channels=unit_channels, 
+                                                                    stride=stride))
+                in_channels = unit_channels
             self.backbone.add_module(f"stage{stage_id + 1}", stage)
 
         self.final_conv_channels = 1024        
-        self.backbone.add_module("final_conv", conv1x1_block(in_channels=in_c, 
+        self.backbone.add_module("final_conv", conv1x1_block(in_channels=in_channels, 
                                                              out_channels=self.final_conv_channels, 
                                                              activation="relu"))
         self.backbone.add_module("global_pool", nn.AdaptiveAvgPool2d(output_size=1))
@@ -209,34 +189,51 @@ class TickNet(nn.Module):
         x = self.classifier(x)
         return x
 
+
 # =============================================================================
-# 5. HÀM KHỞI TẠO (Đã loại bỏ small_7blocks, tối ưu bản basic và small)
+# 5. HÀM KHỞI TẠO MẠNG (BUILDER)
 # =============================================================================
-def build_TickNet(num_classes, typesize='basic', cifar=False):
+def build_TickNet(num_classes, typesize='small', cifar=False):
     init_conv_channels = 32
     
+    # Định nghĩa cấu hình mảng channels 
     if typesize == 'basic':
-        # Bản Basic cấu trúc "Dấu tích đơn": 5 blocks, cực nhẹ nhờ nâng cấp Operator
-        channels = [[128], [64], [128], [256], [512]] 
+        channels = [[128], [64], [128], [256], [512]] # 5 blocks
         
     elif typesize == 'small':
-        # Bản Small tiêu chuẩn: 10 blocks với sức mạnh trích xuất 3D tốt
+        # Bản small gốc (10 blocks)
         channels = [[128], [64, 128], [256, 512, 128], [64, 128, 256], [512]]
         
+    elif typesize == 'small_7blocks':
+        # Kiến trúc 7 blocks 
+        # 1 block đầu giữ kênh 32 + Xương sống dấu tích 6 block
+        channels = [[32], [128, 64, 128], [256, 128, 64], [512]] 
+        
     elif typesize == 'large':
-        # Bản Large (15 blocks)
+        # Bản large gốc (15 blocks)
         channels = [[128], [64, 128], [256, 512, 128, 64, 128, 256], [512, 128, 64, 128, 256], [512]]
     
     else:
         raise ValueError(f"Không hỗ trợ typesize: {typesize}")
 
+    # Xử lý Stride và In_size
     if cifar:
+        in_size = (32, 32)
         init_conv_stride = 1
-        strides = [1, 1, 2, 2, 2] 
+        
+        # Khớp số lượng stride array với số lượng stage thực tế
+        if typesize == 'small_7blocks':
+            strides = [1, 2, 2, 2] # 4 stages
+        else:
+            strides = [1, 1, 2, 2, 2] # 5 stages
     else:
+        in_size = (224, 224)
         init_conv_stride = 2
+        
         if typesize == 'basic':
             strides = [1, 2, 2, 2, 2]
+        elif typesize == 'small_7blocks':
+            strides = [1, 2, 2, 2] # 4 stages
         else:
             strides = [2, 1, 2, 2, 2]
 
@@ -244,5 +241,5 @@ def build_TickNet(num_classes, typesize='basic', cifar=False):
                    init_conv_channels=init_conv_channels,
                    init_conv_stride=init_conv_stride,
                    channels=channels,
-                   strides=strides)
-
+                   strides=strides,
+                   in_size=in_size)
