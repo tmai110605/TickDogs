@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Giả định bạn đã có các hàm cơ bản trong common.py
+
 from .common import conv1x1_block, conv3x3_block, Classifier
 
 # =============================================================================
@@ -94,7 +94,7 @@ class TOP_Operator(nn.Module):
 
 
 # =============================================================================
-# 3. KHỐI LÕI CẢI TIẾN (Tích hợp TOP và MAF)
+# 3. Tích hợp TOP và MAF
 # =============================================================================
 class FR_PDP_block(nn.Module):
     def __init__(self, in_channels, out_channels, stride):
@@ -130,7 +130,7 @@ class FR_PDP_block(nn.Module):
 
 
 # =============================================================================
-# 4. MẠNG TICKNET ĐỘNG (Xây dựng thông qua vòng lặp)
+# 4. MẠNG TICKNET
 # =============================================================================
 class TickNet(nn.Module):
     def __init__(self,
@@ -155,7 +155,7 @@ class TickNet(nn.Module):
                                                             out_channels=init_conv_channels, 
                                                             stride=init_conv_stride))
 
-        # XÂY DỰNG BACKBONE TỰ ĐỘNG DỰA VÀO MẢNG "CHANNELS" VÀ "STRIDES"
+        # XÂY DỰNG BACKBONE 
         in_channels = init_conv_channels
         for stage_id, stage_channels in enumerate(channels):
             stage = nn.Sequential()
@@ -196,7 +196,7 @@ class TickNet(nn.Module):
 def build_TickNet(num_classes, typesize='small', cifar=False):
     init_conv_channels = 32
     
-    # Định nghĩa cấu hình mảng channels linh hoạt
+    # Định nghĩa cấu hình mảng channels 
     if typesize == 'basic':
         channels = [[128], [64], [128], [256], [512]] # 5 blocks
         
@@ -205,8 +205,8 @@ def build_TickNet(num_classes, typesize='small', cifar=False):
         channels = [[128], [64, 128], [256, 512, 128], [64, 128, 256], [512]]
         
     elif typesize == 'small_7blocks':
-        # Kiến trúc 7 blocks mà bạn muốn dùng "extra perceptron"
-        # 1 block đầu giữ kênh 32 (Stem) + Xương sống dấu tích 6 block
+        # Kiến trúc 7 blocks 
+        # 1 block đầu giữ kênh 32 + Xương sống dấu tích 6 block
         channels = [[32], [128, 64, 128], [256, 128, 64], [512]] 
         
     elif typesize == 'large':
