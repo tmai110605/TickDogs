@@ -12,41 +12,29 @@ class Flatten(nn.Module):
     def forward(self, x):
         return x.view(x.size(0), -1)
 
-class MAF_ChannelGate(nn.Module):
+class ChannelGate(nn.Module):
     def __init__(self, gate_channels, reduction_ratio=16):
-        super(MAF_ChannelGate, self).__init__()        
+        super(ChannelGate, self).__init__()        
         self.mlp = nn.Sequential(
             Flatten(),
             nn.Linear(gate_channels, gate_channels // reduction_ratio),
-            nn.ReLU(inplace=True),
+            nn.ReLU(),
             nn.Linear(gate_channels // reduction_ratio, gate_channels)
-        )
-        
-    def forward(self, x):
-        b, c, h, w = x.size()
-        c_half = c // 2
-        
-        x_1 = x[:, :c_half, :, :]
-        x_2 = x[:, c_half:, :, :]
-        
-        avg_pool = F.adaptive_avg_pool2d(x_1, 1)
-        
-        x_2_flat = x_2.contiguous().view(b, c - c_half, h * w)
-        std_pool = torch.std(x_2_flat, dim=2, unbiased=False, keepdim=True).view(b, c - c_half, 1, 1)
-        
-        concat_pool = torch.cat([avg_pool, std_pool], dim=1)
-        channel_att = self.mlp(concat_pool)
-        scale = torch.sigmoid(channel_att).unsqueeze(2).unsqueeze(3).expand_as(x)
-        
+            )        
+    def forward(self, x):        
+        squeeze_avg = F.avg_pool2d( x, (x.size(2), x.size(3)), stride=(x.size(2), x.size(3)))        
+        channel_att = self.mlp(squeeze_avg)
+        scale = F.sigmoid(channel_att).unsqueeze(2).unsqueeze(3).expand_as(x)
         return x * scale
 
-class MAF(nn.Module):
+class SE(nn.Module):
     def __init__(self, gate_channels, reduction_ratio=16):
-        super(MAF, self).__init__()
-        self.ChannelGate = MAF_ChannelGate(gate_channels, reduction_ratio)
-        
+        super(SE, self).__init__()
+        self.ChannelGate = ChannelGate(gate_channels, reduction_ratio)
     def forward(self, x):
-        return self.ChannelGate(x)
+        x_out = self.ChannelGate(x)
+        return x_out
+
 
 
 # =============================================================================
@@ -112,7 +100,7 @@ class FR_PDP_block(nn.Module):
         self.PwR = conv1x1_block(in_channels=in_channels, out_channels=out_channels, stride=stride)
         
         # SỬ DỤNG MAF THAY CHO SE GỐC
-        self.attention = MAF(out_channels, 16)
+        self.attention = SE(out_channels, 16)
 
     def forward(self, x):
         residual = x
